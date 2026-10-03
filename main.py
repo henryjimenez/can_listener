@@ -326,13 +326,16 @@ class DiagnosticReassembler:
             - len(ctx["buffer"])
         )
 
+
         ctx["buffer"].extend(
             payload[:remaining]
         )
 
+
         ctx["next_seq"] = (
             ctx["next_seq"] + 1
         ) & 0x0F
+
 
         ctx["last_time"] = (
             time.monotonic()
@@ -390,6 +393,7 @@ class DiagnosticReassembler:
                 "ascii",
                 errors="replace"
             )
+
 
         print(
             "\n"
