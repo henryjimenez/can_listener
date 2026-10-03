@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""
+Este es un socket basico para  iniciar
+"""
 import argparse
 import socket
 import struct
