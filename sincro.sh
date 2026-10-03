@@ -1,3 +1,3 @@
 git add .
-git commit -m "Sincro auto: $(date '%Y-%m-%d %H-%M-%S')"
+git commit -m "Sincro auto: $(date)"
 git push origin main
