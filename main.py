@@ -626,7 +626,7 @@ def main():
     except KeyboardInterrupt:
 
         print(
-            "\n[Receiver] stopped"
+            "\n[Receiver] detenido"
         )
 
     finally:
