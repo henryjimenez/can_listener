@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-"""
-Este es un socket basico para  iniciar
-se valida interfaz y datos recibidos
-"""
+
 import argparse
+import selectors
 import socket
 import struct
 import time
-# Linux struct can_frame
-#
-# struct can_frame {
-#     canid_t can_id;   // 4 bytes
-#     __u8    can_dlc;  // 1 byte
-#     __u8    __pad;
-#     __u8    __res0;
-#     __u8    __res1;
-#     __u8    data[8];
-# };
-#
+
+
+TELEMETRY_BASE = 0x100
+FAULT_ID = 0x1F0
+
+NOISE_LO = 0x200
+NOISE_HI = 0x2FF
+
+DIAG_BASE = 0x6F0
+NUM_MODULES = 4
+
+MAX_DIAG_LEN = 128
+DIAG_TIMEOUT = 0.15
+
+# Linux struct can_frame:
+# can_id: uint32
+# can_dlc: uint8
+# padding: 3 bytes
+# data: 8 bytes
 FRAME_FMT = "=IB3x8s"
 FRAME_SIZE = struct.calcsize(FRAME_FMT)
-# Flags SocketCAN
-CAN_EFF_FLAG = 0x80000000
-CAN_RTR_FLAG = 0x40000000
-CAN_ERR_FLAG = 0x20000000
-CAN_SFF_MASK = 0x000007FF
-CAN_EFF_MASK = 0x1FFFFFFF
 
 
 def open_can_socket(interface):
@@ -36,137 +36,613 @@ def open_can_socket(interface):
     )
 
     sock.bind((interface,))
+
     return sock
 
 
-def ascii_view(data):
+def unpack_can_frame(frame):
+    can_id, dlc, data = struct.unpack(
+        FRAME_FMT,
+        frame
+    )
+
+    # Eliminar flags de SocketCAN
+    can_id &= 0x1FFFFFFF
+
+    return can_id, dlc, data[:dlc]
+
+
+def decode_telemetry(can_id, data):
     """
-    Convierte bytes a una representación ASCII.
-    Los caracteres no imprimibles se muestran como '.'
+    Payload:
+        uint16 voltage_raw
+        uint16 current_raw
+        uint8  temp_raw
+        uint8  status
+        uint16 seq
     """
 
-    return "".join(
-        chr(b) if 32 <= b <= 126 else "."
-        for b in data
+    if len(data) < 8:
+        print(
+            f"[TELEMETRY] trama demasiado corta "
+            f"ID=0x{can_id:03X}"
+        )
+        return
+
+    v_raw, c_raw, t_raw, status, seq = struct.unpack(
+        "<HHBBH",
+        data[:8]
+    )
+
+    voltage = v_raw * 0.1
+    current = c_raw * 0.01
+    temperature = t_raw - 40
+
+    module = can_id - TELEMETRY_BASE
+
+    enabled = bool(
+        status & 0x01
+    )
+
+    fault = bool(
+        status & 0x02
+    )
+
+    print(
+        f"[TELEMETRY] "
+        f"module={module} "
+        f"id=0x{can_id:03X} "
+        f"seq={seq:5d} "
+        f"V={voltage:7.1f} V "
+        f"I={current:7.2f} A "
+        f"T={temperature:4d} C "
+        f"enabled={enabled} "
+        f"fault={fault}"
     )
 
 
-def decode_can_id(raw_can_id):
-    is_extended = bool(raw_can_id & CAN_EFF_FLAG)
-    is_rtr = bool(raw_can_id & CAN_RTR_FLAG)
-    is_error = bool(raw_can_id & CAN_ERR_FLAG)
+def decode_fault(data):
+    if len(data) < 2:
+        print(
+            "[FAULT] trama demasiado corta"
+        )
+        return
 
-    if is_extended:
-        can_id = raw_can_id & CAN_EFF_MASK
+    module = data[0]
+    code = data[1]
+
+    print(
+        f"[FAULT] "
+        f"module={module} "
+        f"code={code}"
+    )
+
+
+class DiagnosticReassembler:
+
+    def __init__(self):
+        # Un contexto independiente por CAN ID
+        self.contexts = {}
+
+    def cleanup_timeouts(self):
+        now = time.monotonic()
+
+        expired = []
+
+        for can_id, ctx in self.contexts.items():
+
+            elapsed = (
+                now
+                - ctx["last_time"]
+            )
+
+            if elapsed > DIAG_TIMEOUT:
+                expired.append(
+                    can_id
+                )
+
+        for can_id in expired:
+
+            ctx = self.contexts.pop(
+                can_id
+            )
+
+            print(
+                f"[DIAG] timeout "
+                f"id=0x{can_id:03X} "
+                f"received={len(ctx['buffer'])}/"
+                f"{ctx['expected_len']}"
+            )
+
+    def process(self, can_id, data):
+
+        if not data:
+            return
+
+        pci_type = (
+            data[0] >> 4
+        )
+
+        if pci_type == 0x1:
+
+            self.process_first_frame(
+                can_id,
+                data
+            )
+
+        elif pci_type == 0x2:
+
+            self.process_consecutive_frame(
+                can_id,
+                data
+            )
+
+        else:
+
+            print(
+                f"[DIAG] unsupported PCI "
+                f"id=0x{can_id:03X} "
+                f"type=0x{pci_type:X}"
+            )
+
+    def process_first_frame(
+        self,
+        can_id,
+        data
+    ):
+
+        if len(data) < 8:
+
+            print(
+                f"[DIAG] invalid First Frame "
+                f"id=0x{can_id:03X}"
+            )
+
+            return
+
+        total_len = (
+            ((data[0] & 0x0F) << 8)
+            | data[1]
+        )
+
+        # Si había una transferencia activa,
+        # un nuevo FF reinicia ese contexto.
+        if can_id in self.contexts:
+
+            old = self.contexts[
+                can_id
+            ]
+
+            print(
+                f"[DIAG] restart "
+                f"id=0x{can_id:03X} "
+                f"old={len(old['buffer'])}/"
+                f"{old['expected_len']}"
+            )
+
+            del self.contexts[
+                can_id
+            ]
+
+        if total_len <= 6:
+
+            print(
+                f"[DIAG] invalid FF length "
+                f"id=0x{can_id:03X} "
+                f"len={total_len}"
+            )
+
+            return
+
+        if total_len > MAX_DIAG_LEN:
+
+            print(
+                f"[DIAG] oversized message rejected "
+                f"id=0x{can_id:03X} "
+                f"len={total_len}"
+            )
+
+            return
+
+        first_payload = (
+            data[2:8]
+        )
+
+        self.contexts[
+            can_id
+        ] = {
+            "expected_len": total_len,
+            "buffer": bytearray(
+                first_payload
+            ),
+            "next_seq": 1,
+            "last_time": time.monotonic(),
+        }
+
+        print(
+            f"[DIAG] FF "
+            f"id=0x{can_id:03X} "
+            f"len={total_len}"
+        )
+
+        self.check_complete(
+            can_id
+        )
+
+    def process_consecutive_frame(
+        self,
+        can_id,
+        data
+    ):
+
+        if can_id not in self.contexts:
+
+            seq = (
+                data[0] & 0x0F
+            )
+
+            print(
+                f"[DIAG] orphan CF ignored "
+                f"id=0x{can_id:03X} "
+                f"seq={seq}"
+            )
+
+            return
+
+        ctx = self.contexts[
+            can_id
+        ]
+
+        seq = (
+            data[0] & 0x0F
+        )
+
+        expected = ctx[
+            "next_seq"
+        ]
+
+        if seq != expected:
+
+            print(
+                f"[DIAG] sequence error "
+                f"id=0x{can_id:03X} "
+                f"expected={expected} "
+                f"received={seq} "
+                f"-> abort"
+            )
+
+            del self.contexts[
+                can_id
+            ]
+
+            return
+
+        payload = (
+            data[1:8]
+        )
+
+        remaining = (
+            ctx["expected_len"]
+            - len(ctx["buffer"])
+        )
+
+        ctx["buffer"].extend(
+            payload[:remaining]
+        )
+
+        ctx["next_seq"] = (
+            ctx["next_seq"] + 1
+        ) & 0x0F
+
+        ctx["last_time"] = (
+            time.monotonic()
+        )
+
+        print(
+            f"[DIAG] CF "
+            f"id=0x{can_id:03X} "
+            f"seq={seq} "
+            f"bytes={len(ctx['buffer'])}/"
+            f"{ctx['expected_len']}"
+        )
+
+        self.check_complete(
+            can_id
+        )
+
+    def check_complete(
+        self,
+        can_id
+    ):
+
+        if can_id not in self.contexts:
+            return
+
+        ctx = self.contexts[
+            can_id
+        ]
+
+        if (
+            len(ctx["buffer"])
+            < ctx["expected_len"]
+        ):
+            return
+
+        payload = bytes(
+            ctx["buffer"][
+                :ctx["expected_len"]
+            ]
+        )
+
+        del self.contexts[
+            can_id
+        ]
+
+        try:
+
+            text = payload.decode(
+                "ascii"
+            )
+
+        except UnicodeDecodeError:
+
+            text = payload.decode(
+                "ascii",
+                errors="replace"
+            )
+
+        print(
+            "\n"
+            "========================================\n"
+            "[DIAG COMPLETE]\n"
+            f"CAN ID : 0x{can_id:03X}\n"
+            f"TEXT   : {text}\n"
+            "========================================\n"
+        )
+
+
+def is_telemetry(can_id):
+
+    return (
+        TELEMETRY_BASE
+        <= can_id
+        < TELEMETRY_BASE + NUM_MODULES
+    )
+
+
+def is_diagnostic(can_id):
+
+    return (
+        DIAG_BASE
+        <= can_id
+        < DIAG_BASE + NUM_MODULES
+    )
+
+
+def process_frame(
+    frame,
+    diag,
+    show_noise
+):
+
+    if len(frame) != FRAME_SIZE:
+
+        print(
+            f"[WARN] invalid frame size: "
+            f"{len(frame)}"
+        )
+
+        return
+
+    can_id, dlc, data = (
+        unpack_can_frame(
+            frame
+        )
+    )
+
+    if is_telemetry(
+        can_id
+    ):
+
+        decode_telemetry(
+            can_id,
+            data
+        )
+
+    elif can_id == FAULT_ID:
+
+        decode_fault(
+            data
+        )
+
+    elif is_diagnostic(
+        can_id
+    ):
+
+        diag.process(
+            can_id,
+            data
+        )
+
+    elif (
+        NOISE_LO
+        <= can_id
+        <= NOISE_HI
+    ):
+
+        if show_noise:
+
+            print(
+                f"[NOISE] "
+                f"id=0x{can_id:03X} "
+                f"dlc={dlc} "
+                f"data={data.hex(' ')}"
+            )
+
     else:
-        can_id = raw_can_id & CAN_SFF_MASK
 
-    return can_id, is_extended, is_rtr, is_error
+        print(
+            f"[UNKNOWN] "
+            f"id=0x{can_id:03X} "
+            f"dlc={dlc} "
+            f"data={data.hex(' ')}"
+        )
 
 
 def main():
+
     parser = argparse.ArgumentParser(
-        description="Generic SocketCAN sniffer using Python standard library"
+        description=(
+            "Non-blocking CAN receiver "
+            "using Python standard library only"
+        )
     )
 
     parser.add_argument(
         "--iface",
         default="vcan0",
-        help="CAN interface (default: vcan0)"
+        help=(
+            "SocketCAN interface, "
+            "default: vcan0"
+        )
     )
 
     parser.add_argument(
-        "--relative-time",
+        "--show-noise",
         action="store_true",
-        help="Show elapsed time instead of wall clock"
+        help="Print noise frames"
+    )
+
+    parser.add_argument(
+        "--poll-timeout",
+        type=float,
+        default=0.05,
+        help=(
+            "Selector timeout in seconds, "
+            "default: 0.05"
+        )
     )
 
     args = parser.parse_args()
 
-    sock = open_can_socket(args.iface)
-
-    start_time = time.monotonic()
-
-    print()
-    print(f"Listening on interface: {args.iface}")
-    print(f"CAN frame size      : {FRAME_SIZE} bytes")
-    print()
-    print(
-        "TIME              TYPE ID         DLC DATA                     ASCII"
+    sock = open_can_socket(
+        args.iface
     )
-    print(
-        "--------------------------------------------------------------------------"
+
+    # Convertimos el socket a no bloqueante.
+    sock.setblocking(
+        False
     )
+
+    diag = (
+        DiagnosticReassembler()
+    )
+
+    selector = (
+        selectors.DefaultSelector()
+    )
+
+    selector.register(
+        sock,
+        selectors.EVENT_READ
+    )
+
+    print(
+        f"[Receiver] "
+        f"listening on {args.iface}"
+    )
+
+    print(
+        f"[Receiver] "
+        f"non-blocking mode, "
+        f"poll_timeout="
+        f"{args.poll_timeout}s"
+    )
+
+    running = True
 
     try:
-        while True:
 
-            frame = sock.recv(FRAME_SIZE)
+        while running:
 
-            if len(frame) != FRAME_SIZE:
-                print(
-                    f"[WARNING] Received invalid frame size: "
-                    f"{len(frame)}"
-                )
-                continue
-
-            raw_can_id, dlc, raw_data = struct.unpack(
-                FRAME_FMT,
-                frame
+            # Espera como máximo poll_timeout.
+            # Nunca queda bloqueado
+            # indefinidamente esperando CAN.
+            events = selector.select(
+                timeout=args.poll_timeout
             )
 
-            can_id, extended, rtr, error = decode_can_id(
-                raw_can_id
-            )
+            # Esto se ejecuta incluso si
+            # no llega ninguna trama.
+            diag.cleanup_timeouts()
 
-            data = raw_data[:dlc]
+            for key, mask in events:
 
-            if args.relative_time:
-                timestamp = (
-                    f"{time.monotonic() - start_time:10.6f}"
-                )
-            else:
-                timestamp = time.strftime(
-                    "%H:%M:%S"
-                ) + f".{int((time.time() % 1) * 1000):03d}"
+                if (
+                    mask
+                    & selectors.EVENT_READ
+                ):
 
-            if error:
-                frame_type = "ERR"
+                    # Leemos todas las tramas
+                    # que ya estén disponibles.
+                    #
+                    # Debido a setblocking(False),
+                    # recv() nunca espera:
+                    # cuando se vacía la cola
+                    # lanza BlockingIOError.
+                    while True:
 
-            elif rtr:
-                frame_type = "RTR"
+                        try:
 
-            elif extended:
-                frame_type = "EXT"
+                            frame = (
+                                sock.recv(
+                                    FRAME_SIZE
+                                )
+                            )
 
-            else:
-                frame_type = "STD"
+                        except BlockingIOError:
 
-            if extended:
-                id_string = f"{can_id:08X}"
-            else:
-                id_string = f"{can_id:03X}"
+                            # No quedan más
+                            # tramas disponibles.
+                            break
 
-            hex_data = " ".join(
-                f"{byte:02X}"
-                for byte in data
-            )
+                        except OSError as exc:
 
-            ascii_data = ascii_view(data)
+                            print(
+                                f"[ERROR] "
+                                f"socket recv failed: "
+                                f"{exc}"
+                            )
 
-            print(
-                f"{timestamp:<17} "
-                f"{frame_type:<4} "
-                f"{id_string:<10} "
-                f"{dlc:<3} "
-                f"{hex_data:<24} "
-                f"{ascii_data}"
-            )
+                            running = False
+                            break
+
+                        process_frame(
+                            frame,
+                            diag,
+                            args.show_noise
+                        )
+
     except KeyboardInterrupt:
-        print()
-        print("Sniffer stopped.")
+
+        print(
+            "\n[Receiver] stopped"
+        )
 
     finally:
+
+        try:
+
+            selector.unregister(
+                sock
+            )
+
+        except Exception:
+            pass
+
+        selector.close()
         sock.close()
+
+
 if __name__ == "__main__":
     main()
